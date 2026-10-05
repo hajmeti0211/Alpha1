@@ -628,6 +628,7 @@ const Router = {
 	},
 	async handlePanel(request, env) {
 		const hasPassword = await DbService.getPanelPassword(env.DB);
+		const panelUsername = await DbService.getPanelUsername(env.DB);
 		let gfxSetting = 'false';
 		let themeSetting = 'dark';
 			try {
@@ -637,7 +638,7 @@ const Router = {
 				if (themeRow && themeRow.value === 'light') themeSetting = 'light';
 			} catch (e) {}
 		
-		if (!hasPassword) {
+		if (!hasPassword || !panelUsername) {
 			return new Response(HTML_TEMPLATES.setup.replace(/\/\*\{\{GFX_SETTING\}\}\*\//g, gfxSetting).replace(/\/\*\{\{THEME_SETTING\}\}\*\//g, themeSetting), {
 				headers: { "Content-Type": "text/html; charset=utf-8" },
 			});
@@ -732,6 +733,35 @@ const Router = {
 	},
 	async handleApi(request, url, env, ctx) {
 		const hasPassword = await DbService.getPanelPassword(env.DB);
+		const panelUsername = await DbService.getPanelUsername(env.DB);
+		if (url.pathname === "/api/setup-account" && request.method === "POST") {
+			if (hasPassword && panelUsername) {
+				return new Response(JSON.stringify({ error: "حساب مدیر از قبل تعریف شده است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const { username, password, confirm_password } = await readJsonBody(request);
+			const cleanUsername = (username || "").trim();
+			const cleanPassword = (password || "").trim();
+			const cleanConfirm = (confirm_password || "").trim();
+			if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(cleanUsername)) {
+				return new Response(JSON.stringify({ error: "نام کاربری باید ۳ تا ۳۲ کاراکتر و فقط شامل حروف، عدد، _، - یا . باشد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (cleanPassword.length < 4) {
+				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			if (cleanPassword !== cleanConfirm) {
+				return new Response(JSON.stringify({ error: "رمز عبور و تکرار آن یکسان نیستند" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
+			const hashed = await DbService.sha256(cleanPassword);
+			await DbService.setPanelPassword(env.DB, hashed);
+			await DbService.setPanelUsername(env.DB, cleanUsername);
+			LOGIN_ATTEMPTS.clear();
+			return new Response(JSON.stringify({ success: true }), {
+				headers: {
+					"Content-Type": "application/json; charset=utf-8",
+					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+				},
+			});
+		}
 		if (url.pathname === "/api/setup-password" && request.method === "POST") {
 			if (hasPassword) {
 				return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
@@ -773,7 +803,11 @@ const Router = {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const { password } = await readJsonBody(request);
+			const { username, password } = await readJsonBody(request);
+			const cleanUsername = (username || "").trim();
+			if (panelUsername && cleanUsername.toLowerCase() !== panelUsername.toLowerCase()) {
+				return new Response(JSON.stringify({ error: "نام کاربری یا رمز عبور اشتباه است" }), { status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } });
+			}
 			const cleanPassword = (password || "").trim();
 			const hashedInput = await DbService.sha256(cleanPassword);
 			const storedHash = await DbService.getPanelPassword(env.DB, true);
@@ -1552,6 +1586,17 @@ const DbService = {
 	async setPanelPassword(db, password) {
 		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
 		cachedPanelPassword = password;
+	},
+	async getPanelUsername(db) {
+		try {
+			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_username'").first();
+			return row && row.value ? row.value : null;
+		} catch (e) {
+			return null;
+		}
+	},
+	async setPanelUsername(db, username) {
+		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_username', ?)").bind(username).run();
 	},
 	async verifyApiAuth(request, env) {
 		const storedPasswordHash = await this.getPanelPassword(env.DB);
@@ -4579,214 +4624,67 @@ const HTML_TEMPLATES = {
 	setup: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>تعریف رمز عبور پـنـل</title>
-	${COMMON_HEAD}
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center justify-center p-4 gap-6">
-	<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-6 relative z-10">
-		<h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">تنظیم رمز عبور جدید</h2>
-		<p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">این اولین ورود شما به پـنـل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
-		<form onsubmit="handleSetup(event)" class="space-y-4">
-			<div>
-				<label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-				<input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
-			</div>
-			<div>
-				<label class="block text-sm font-medium mb-1.5">تکرار رمز عبور</label>
-				<input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
-			</div>
-			<button type="submit" id="submit-btn" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">ثبت و ورود</button>
-		</form>
-	</div>
-	<div class="flex flex-col gap-4 relative z-10 w-full max-w-md">
-		<div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-			<a href="https://github.com/panel-zeus/Z-E-U-S" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
-				<svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
-					<path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
-				</svg>
-				گیت‌هاب
-			</a>
-			<a href="https://t.me/PANEL_ZEUS" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
-				<svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
-					<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
-				</svg>
-				ALPHA COMMUNITY
-			</a>
-		</div>
-		<div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-			<a href="https://t.me/ZEUS_PANEL_BOT" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-amber-600 dark:text-amber-400 hover:text-amber-500 dark:hover:text-amber-300 group">
-				<svg class="w-5 h-5 text-amber-500 dark:text-amber-400 group-hover:scale-110 transition" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
-					<path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
-				</svg>
-				ساخت رایگان پـنـل
-			</a>
-			<a href="https://donatonion.ir-netlify.workers.dev" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-red-600 dark:text-red-400 hover:text-red-500 dark:hover:text-red-300 group">
-				<svg class="w-5 h-5 text-red-500 dark:text-red-400 group-hover:scale-110 transition" fill="currentColor" viewBox="0 0 24 24">
-					<path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
-				</svg>
-				دونیت
-			</a>
-		</div>
-	</div>
-	${COMMON_TOAST_HTML}
-	<script>
-		${COMMON_TOAST_JS};
-		async function handleSetup(event) {
-			event.preventDefault();
-			const password = document.getElementById('password').value.trim();
-			const confirmPassword = document.getElementById('confirm-password').value.trim();
-			const btn = document.getElementById('submit-btn');
-			if (password !== confirmPassword) {
-				alert('⚠️ رمز عبور و تکرار آن مطابقت ندارند!');
-				return;
-			}
-			btn.disabled = true;
-			btn.innerText = 'در حال ثبت...';
-			try {
-				const res = await fetch('/api/setup-password', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ password })
-				});
-				const data = await res.json();
-				if (res.ok && data.success) {
-					alert('✅ رمز عبور با موفقیت تنظیم شد. در حال ورود...');
-					setTimeout(() => {
-						window.location.reload();
-					}, 1500);
-				} else {
-					alert('خطا: ' + (data.error || 'عملیات ناموفق بود'));
-				}
-			} catch (err) {
-				alert('خطا در ارتباط با سرور');
-			} finally {
-				btn.disabled = false;
-				btn.innerText = 'ثبت و ورود';
-			}
-		}
-	</script>
-	${COMMON_WAVES_SCRIPT}
-</body>
-</html>`,
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alpha • راه‌اندازی مدیر</title>${COMMON_HEAD}
+<style>
+:root{--a:#38bdf8;--b:#8b5cf6;--c:#22d3ee;--bg:#020617;--text:#f8fafc}*{box-sizing:border-box}body{margin:0;font-family:Vazirmatn,system-ui,sans-serif;background:radial-gradient(circle at 15% 10%,color-mix(in srgb,var(--a) 18%,transparent),transparent 30%),radial-gradient(circle at 85% 90%,color-mix(in srgb,var(--b) 20%,transparent),transparent 35%),var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}.scene{position:fixed;inset:0;pointer-events:none;overflow:hidden}.scene:before{content:"";position:absolute;inset:-20%;background:conic-gradient(from 0deg,transparent,var(--a),transparent,var(--b),transparent);filter:blur(80px);opacity:.13;animation:spin 18s linear infinite}.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:42px 42px;mask-image:linear-gradient(to bottom,black,transparent)}.orb{position:absolute;border-radius:50%;filter:blur(70px);animation:float 8s ease-in-out infinite}.o1{width:280px;height:280px;background:var(--a);top:-100px;left:-80px;opacity:.22}.o2{width:320px;height:320px;background:var(--b);bottom:-140px;right:-90px;opacity:.2;animation-delay:-3s}.wrap{width:min(560px,94vw);position:relative;z-index:2}.card{position:relative;padding:28px;border-radius:30px;background:linear-gradient(145deg,rgba(15,23,42,.72),rgba(2,6,23,.54));border:1px solid rgba(255,255,255,.13);box-shadow:0 35px 100px rgba(0,0,0,.5),inset 0 1px rgba(255,255,255,.12);backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);transform-style:preserve-3d;animation:cardIn .8s cubic-bezier(.2,.8,.2,1)}.card:after{content:"";position:absolute;inset:-1px;border-radius:30px;padding:1px;background:linear-gradient(120deg,transparent 10%,var(--a),var(--b),transparent 90%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;opacity:.65;animation:borderFlow 5s linear infinite}.logo{width:76px;height:76px;margin:0 auto 14px;border-radius:24px;display:grid;place-items:center;font-size:42px;font-weight:1000;background:linear-gradient(145deg,var(--a),var(--b));box-shadow:0 0 45px color-mix(in srgb,var(--a) 38%,transparent);transform:translateZ(30px);animation:float 5s ease-in-out infinite}.title{text-align:center;font-size:28px;font-weight:1000;letter-spacing:.08em}.sub{text-align:center;color:#94a3b8;font-size:12px;margin-top:6px}.field{margin-top:16px}.field label{display:block;font-size:12px;color:#cbd5e1;margin-bottom:7px}.input{width:100%;height:52px;padding:0 15px;border-radius:16px;border:1px solid rgba(148,163,184,.18);background:rgba(2,8,23,.52);color:#fff;outline:none;box-shadow:inset 0 1px rgba(255,255,255,.04);transition:.25s}.input:focus{border-color:var(--a);box-shadow:0 0 0 3px color-mix(in srgb,var(--a) 12%,transparent),0 0 28px color-mix(in srgb,var(--a) 10%,transparent)}.pass{position:relative}.eye{position:absolute;left:10px;top:9px;width:34px;height:34px;border:0;border-radius:11px;background:rgba(255,255,255,.06);color:#cbd5e1;cursor:pointer}.primary{width:100%;margin-top:20px;height:54px;border:0;border-radius:16px;color:#fff;font-weight:1000;background:linear-gradient(100deg,var(--a),#2563eb,var(--b));box-shadow:0 15px 38px color-mix(in srgb,var(--a) 18%,transparent);cursor:pointer;transition:.25s}.primary:hover{transform:translateY(-2px);filter:brightness(1.08)}.tools{display:flex;justify-content:space-between;gap:8px;margin-top:16px}.tool{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#cbd5e1;border-radius:13px;padding:8px 12px;font-size:11px;cursor:pointer}.colors{display:flex;align-items:center;justify-content:center;gap:9px;margin:20px 0 8px}.swatch{width:24px;height:24px;border-radius:50%;border:2px solid rgba(255,255,255,.55);cursor:pointer;box-shadow:0 0 15px currentColor;animation:pulse 2.2s ease-in-out infinite}.swatch:nth-child(2){animation-delay:.2s}.swatch:nth-child(3){animation-delay:.4s}.swatch:nth-child(4){animation-delay:.6s}.swatch:nth-child(5){animation-delay:.8s}.telegram{margin-top:16px;display:flex;align-items:center;justify-content:center;gap:10px;padding:14px 16px;border-radius:18px;text-decoration:none;color:#e0f2fe;background:linear-gradient(120deg,rgba(14,165,233,.12),rgba(255,255,255,.045));border:1px solid rgba(56,189,248,.25);box-shadow:inset 0 1px rgba(255,255,255,.08);transition:.25s}.telegram:hover{transform:translateY(-2px);border-color:var(--a)}.tg{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:#229ed9;box-shadow:0 0 20px rgba(34,158,217,.35)}.credits{display:flex;gap:10px;margin-top:10px}.credit{flex:1;text-align:center;padding:10px;border-radius:15px;color:#94a3b8;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);font-size:11px}.credit b{display:block;color:#e2e8f0;margin-top:3px}.bar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(700px,92vw);height:7px;border-radius:999px;background:linear-gradient(90deg,#22d3ee,#3b82f6,#8b5cf6,#ec4899,#f59e0b,#22c55e,#22d3ee);background-size:300% 100%;box-shadow:0 0 24px rgba(59,130,246,.35);animation:rainbow 5s linear infinite;z-index:3}.en .fa{display:none}.en .en{display:inline}.en .fa{display:none}.fa{display:inline}.en .en{display:inline}.en .fa{display:none}@keyframes rainbow{to{background-position:300% 0}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}@keyframes pulse{50%{transform:scale(1.12)}}@keyframes cardIn{from{opacity:0;transform:translateY(25px) rotateX(7deg)}to{opacity:1;transform:none}}@keyframes borderFlow{to{filter:hue-rotate(360deg)}}@media(max-width:520px){.card{padding:21px;border-radius:24px}.title{font-size:24px}.credits{flex-direction:column}.bar{bottom:8px}}
+</style></head>
+<body class="fa">
+<div class="scene"><div class="grid"></div><div class="orb o1"></div><div class="orb o2"></div></div>
+<main class="wrap">
+<section class="card">
+<div class="logo">A</div><div class="title">ALPHA</div><div class="sub"><span class="fa">راه‌اندازی حساب مدیر</span><span class="en" style="display:none">Create your admin account</span></div>
+<form id="setup-form" onsubmit="handleSetup(event)">
+<div class="field"><label><span class="fa">نام کاربری</span><span class="en" style="display:none">Username</span></label><input id="username" class="input" autocomplete="username" placeholder="admin" required minlength="3" maxlength="32"></div>
+<div class="field"><label><span class="fa">رمز عبور</span><span class="en" style="display:none">Password</span></label><div class="pass"><input id="password" type="password" class="input" autocomplete="new-password" placeholder="••••••••" required minlength="4"><button class="eye" type="button" onclick="toggleEye('password',this)">◉</button></div></div>
+<div class="field"><label><span class="fa">تکرار رمز عبور</span><span class="en" style="display:none">Confirm password</span></label><div class="pass"><input id="confirm" type="password" class="input" autocomplete="new-password" placeholder="••••••••" required minlength="4"><button class="eye" type="button" onclick="toggleEye('confirm',this)">◉</button></div></div>
+<button class="primary" id="submit-btn" type="submit"><span class="fa">ثبت حساب و ورود</span><span class="en" style="display:none">Create & Sign in</span></button>
+</form>
+<div class="tools"><button class="tool" onclick="toggleLang()">🌐 فارسی / English</button><button class="tool" onclick="toggleTheme()">☀️ / 🌙 <span class="fa">تم</span><span class="en" style="display:none">Theme</span></button></div>
+<div class="colors" aria-label="colors"><button class="swatch" style="background:#22d3ee;color:#22d3ee" onclick="setColor('#22d3ee','#3b82f6')"></button><button class="swatch" style="background:#8b5cf6;color:#8b5cf6" onclick="setColor('#8b5cf6','#ec4899')"></button><button class="swatch" style="background:#14b8a6;color:#14b8a6" onclick="setColor('#14b8a6','#22c55e')"></button><button class="swatch" style="background:#f59e0b;color:#f59e0b" onclick="setColor('#f59e0b','#ef4444')"></button><button class="swatch" style="background:#ec4899;color:#ec4899" onclick="setColor('#ec4899','#8b5cf6')"></button></div>
+<a class="telegram" href="https://t.me/Mehtif" target="_blank" rel="noopener"><span class="tg">➤</span><span><b><span class="fa">کانال تلگرام Alpha</span><span class="en" style="display:none">Alpha Telegram Channel</span></b><small> @Mehtif</small></span></a>
+<div class="credits"><a class="credit" href="https://t.me/V2rayTun0" target="_blank" rel="noopener"><span class="fa">سازنده</span><span class="en" style="display:none">Creator</span><b>@V2rayTun0</b></a><div class="credit"><span class="fa">پروژه</span><span class="en" style="display:none">Project</span><b>Alpha</b></div></div>
+</section></main><div class="bar"></div>
+<script>
+function toggleEye(id,btn){const i=document.getElementById(id);i.type=i.type==='password'?'text':'password';btn.textContent=i.type==='password'?'◉':'◎'}
+function setColor(a,b){document.documentElement.style.setProperty('--a',a);document.documentElement.style.setProperty('--b',b);localStorage.setItem('alpha-a',a);localStorage.setItem('alpha-b',b)}
+function toggleTheme(){const light=document.body.dataset.theme==='light';document.body.dataset.theme=light?'dark':'light';document.body.style.setProperty('--bg',light?'#020617':'#eef6ff');document.body.style.setProperty('--text',light?'#f8fafc':'#0f172a');localStorage.setItem('alpha-theme',light?'dark':'light')}
+function applyPrefs(){const a=localStorage.getItem('alpha-a'),b=localStorage.getItem('alpha-b');if(a&&b)setColor(a,b);if(localStorage.getItem('alpha-theme')==='light'){document.body.dataset.theme='light';document.body.style.setProperty('--bg','#eef6ff');document.body.style.setProperty('--text','#0f172a')}}
+function toggleLang(){const en=document.body.classList.contains('en');document.body.classList.toggle('en',!en);document.body.dir=en?'rtl':'ltr';document.documentElement.lang=en?'fa':'en';localStorage.setItem('alpha-lang',en?'fa':'en')}
+async function handleSetup(e){e.preventDefault();const username=document.getElementById('username').value.trim(),password=document.getElementById('password').value.trim(),confirm_password=document.getElementById('confirm').value.trim(),btn=document.getElementById('submit-btn');if(password!==confirm_password){alert('رمز عبور و تکرار آن یکسان نیستند');return}btn.disabled=true;btn.style.opacity='.6';try{const r=await fetch('/api/setup-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password,confirm_password})});const d=await r.json();if(r.ok&&d.success){location.href='/panel'}else alert(d.error||'خطا در راه‌اندازی حساب')}catch(e){alert('خطا در ارتباط با سرور')}finally{btn.disabled=false;btn.style.opacity='1'}}
+applyPrefs();if(localStorage.getItem('alpha-lang')==='en')toggleLang();
+</script></body></html>`,
 	login: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Alpha Control Center</title>
-	${COMMON_HEAD}
-</head>
-<body class="alpha-login-shell min-h-screen text-white flex items-center justify-center p-4 overflow-hidden">
-	<div class="alpha-login-orb alpha-orb-a"></div>
-	<div class="alpha-login-orb alpha-orb-b"></div>
-	<div class="alpha-login-grid"></div>
-	<div class="alpha-login-wrap w-full max-w-5xl relative z-10">
-		<div class="alpha-login-brand text-center mb-6">
-			<div class="alpha-logo-mark">A</div>
-			<div class="text-3xl sm:text-4xl font-black tracking-[0.18em]">ALPHA</div>
-			<p class="text-xs sm:text-sm text-slate-300 mt-2">Control your panel. Manage every module from one place.</p>
-		</div>
-		<div class="grid lg:grid-cols-[1.05fr_0.95fr] gap-5 items-stretch">
-			<div class="hidden lg:flex alpha-login-preview rounded-3xl p-7 flex-col justify-between">
-				<div>
-					<div class="flex items-center justify-between mb-8"><span class="text-xs uppercase tracking-[0.2em] text-cyan-300">Alpha Control Center</span><span class="alpha-live-dot">● Live</span></div>
-					<h2 class="text-4xl font-black leading-tight">A cleaner glass interface<br><span class="text-cyan-300">for the complete panel.</span></h2>
-					<p class="mt-4 text-sm leading-7 text-slate-300 max-w-md">All existing management areas remain available through a single modular dashboard, with the original backend actions preserved.</p>
-				</div>
-				<div class="grid grid-cols-2 gap-3">
-					<div class="alpha-mini-card"><span>Users</span><b>Management</b></div>
-					<div class="alpha-mini-card"><span>Tools</span><b>Diagnostics</b></div>
-					<div class="alpha-mini-card"><span>Backup</span><b>Data safety</b></div>
-					<div class="alpha-mini-card"><span>System</span><b>Settings</b></div>
-				</div>
-			</div>
-			<div class="alpha-glass-card rounded-3xl p-6 sm:p-8">
-				<div id="login-section">
-					<div class="flex items-center gap-3 mb-7">
-						<div class="alpha-small-logo">A</div>
-						<div><h2 class="text-xl font-black">Welcome back</h2><p class="text-xs text-slate-400 mt-1">Sign in to Alpha Control Center</p></div>
-					</div>
-					<form onsubmit="handleLogin(event)" class="space-y-4">
-						<div><label class="block text-xs font-bold text-slate-300 mb-2">رمز عبور مدیریت</label><div class="alpha-input-wrap"><span>⌘</span><input type="password" id="password" autocomplete="current-password" placeholder="••••••••••••" class="alpha-input" required></div></div>
-						<button type="submit" id="submit-btn" class="alpha-primary-btn w-full">ورود به Alpha</button>
-					</form>
-					<div class="flex items-center gap-3 my-5"><div class="h-px bg-white/10 flex-1"></div><span class="text-[10px] text-slate-500">SECURE ACCESS</span><div class="h-px bg-white/10 flex-1"></div></div>
-					<button onclick="toggleRecovery(true)" class="w-full text-xs text-cyan-300 hover:text-cyan-200 transition font-bold py-2">بازیابی رمز پنل</button>
-				</div>
-				<div id="recovery-section" class="hidden">
-					<div class="flex items-center gap-3 mb-6"><div class="alpha-small-logo">A</div><div><h2 class="text-xl font-black">بازیابی دسترسی</h2><p class="text-xs text-slate-400 mt-1">Cloudflare ownership verification</p></div></div>
-					<div class="alpha-recovery-note">برای احراز مالکیت پنل، از مسیر Cloudflare توکن لازم را دریافت و در کادر زیر وارد کنید.</div>
-					<a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Alpha-Deployer-Token" target="_blank" class="alpha-secondary-btn w-full mt-3">دریافت توکن از Cloudflare</a>
-					<form onsubmit="handleRecovery(event)" class="space-y-4 mt-4"><div><input type="password" id="api-token" placeholder="توکن را وارد کنید" class="alpha-input standalone" required></div><div class="flex gap-2"><button type="button" onclick="toggleRecovery(false)" class="alpha-danger-btn w-1/3">انصراف</button><button type="submit" id="recover-btn" class="alpha-primary-btn w-2/3">بازیابی رمز پنل</button></div></form>
-				</div>
-			</div>
-		</div>
-	</div>
-	<div class="mt-5 text-center text-[10px] text-slate-500">Alpha • Secure Glass Control Interface</div>
-	${COMMON_TOAST_HTML}
-	<script>
-		${COMMON_TOAST_JS}
-		async function handleLogin(event) {
-			event.preventDefault();
-			const password = document.getElementById('password').value.trim();
-			const btn = document.getElementById('submit-btn');
-			btn.disabled = true;
-			try {
-				const res = await fetch('/api/login', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ password })
-				});
-				const data = await res.json();
-				if (res.ok && data.success) {
-					window.location.reload();
-				} else {
-					alert(data.error || '❌ رمز عبور اشتباه است');
-				}
-			} catch (err) {
-				alert('خطا در ارتباط با سرور');
-			} finally {
-				btn.disabled = false;
-			}
-		}
-		function toggleRecovery(show) {
-			document.getElementById('login-section').classList.toggle('hidden', show);
-			document.getElementById('recovery-section').classList.toggle('hidden', !show);
-		}
-		async function handleRecovery(event) {
-			event.preventDefault();
-			const apiToken = document.getElementById('api-token').value;
-			const btn = document.getElementById('recover-btn');
-			btn.disabled = true;
-			btn.innerText = 'در حال بررسی...';
-			try {
-				const res = await fetch('/api/recover', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ api_token: apiToken })
-				});
-				const data = await res.json();
-				if (res.ok && data.success) {
-					alert('✅ رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
-					setTimeout(() => {
-						window.location.reload();
-					}, 1500);
-				} else {
-					alert('❌ ' + (data.error || 'خطا در تایید اطلاعات'));
-				}
-			} catch (err) {
-				alert('خطا در ارتباط با سرور');
-			} finally {
-				btn.disabled = false;
-				btn.innerText = 'بازیابی رمز Alpha';
-			}
-		}
-	</script>
-	${COMMON_WAVES_SCRIPT}
-</body>
-</html>`,
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alpha • ورود</title>${COMMON_HEAD}
+<style>
+:root{--a:#38bdf8;--b:#8b5cf6;--bg:#020617;--text:#f8fafc}*{box-sizing:border-box}body{margin:0;font-family:Vazirmatn,system-ui,sans-serif;background:radial-gradient(circle at 12% 10%,color-mix(in srgb,var(--a) 18%,transparent),transparent 30%),radial-gradient(circle at 88% 90%,color-mix(in srgb,var(--b) 20%,transparent),transparent 35%),var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}.scene{position:fixed;inset:0;pointer-events:none;overflow:hidden}.scene:before{content:"";position:absolute;inset:-20%;background:conic-gradient(from 0deg,transparent,var(--a),transparent,var(--b),transparent);filter:blur(85px);opacity:.13;animation:spin 18s linear infinite}.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:42px 42px;mask-image:linear-gradient(to bottom,black,transparent 92%)}.orb{position:absolute;border-radius:50%;filter:blur(75px);animation:float 8s ease-in-out infinite}.o1{width:280px;height:280px;background:var(--a);top:-110px;left:-90px;opacity:.2}.o2{width:340px;height:340px;background:var(--b);bottom:-160px;right:-100px;opacity:.2;animation-delay:-3s}.wrap{width:min(520px,94vw);position:relative;z-index:2}.card{position:relative;padding:30px;border-radius:32px;background:linear-gradient(145deg,rgba(15,23,42,.74),rgba(2,6,23,.56));border:1px solid rgba(255,255,255,.13);box-shadow:0 40px 110px rgba(0,0,0,.55),inset 0 1px rgba(255,255,255,.13);backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px);transform-style:preserve-3d;animation:cardIn .8s cubic-bezier(.2,.8,.2,1)}.card:before{content:"";position:absolute;inset:-1px;border-radius:32px;padding:1px;background:linear-gradient(120deg,transparent,var(--a),var(--b),#ec4899,transparent);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;opacity:.65;animation:borderFlow 5s linear infinite}.logo{width:84px;height:84px;margin:0 auto 14px;border-radius:26px;display:grid;place-items:center;font-size:46px;font-weight:1000;background:linear-gradient(145deg,var(--a),var(--b));box-shadow:0 0 55px color-mix(in srgb,var(--a) 35%,transparent);animation:float 5s ease-in-out infinite;transform:translateZ(35px)}.brand{text-align:center;font-size:32px;font-weight:1000;letter-spacing:.16em}.sub{text-align:center;color:#94a3b8;font-size:12px;margin-top:7px}.field{margin-top:16px}.field label{display:block;font-size:12px;color:#cbd5e1;margin-bottom:7px}.input-wrap{position:relative}.input{width:100%;height:54px;padding:0 16px;border-radius:17px;border:1px solid rgba(148,163,184,.18);background:rgba(2,8,23,.5);color:#fff;outline:none;transition:.25s}.input:focus{border-color:var(--a);box-shadow:0 0 0 3px color-mix(in srgb,var(--a) 12%,transparent),0 0 30px color-mix(in srgb,var(--a) 10%,transparent)}.eye{position:absolute;left:10px;top:10px;width:34px;height:34px;border:0;border-radius:11px;background:rgba(255,255,255,.06);color:#cbd5e1;cursor:pointer}.primary{width:100%;margin-top:20px;height:55px;border:0;border-radius:17px;color:#fff;font-weight:1000;background:linear-gradient(100deg,var(--a),#2563eb,var(--b));box-shadow:0 16px 40px color-mix(in srgb,var(--a) 20%,transparent);cursor:pointer;transition:.25s}.primary:hover{transform:translateY(-2px);filter:brightness(1.08)}.tools{display:flex;justify-content:space-between;gap:8px;margin-top:15px}.tool{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#cbd5e1;border-radius:13px;padding:8px 12px;font-size:11px;cursor:pointer}.colors{display:flex;align-items:center;justify-content:center;gap:9px;margin:20px 0 9px}.swatch{width:25px;height:25px;border-radius:50%;border:2px solid rgba(255,255,255,.55);cursor:pointer;box-shadow:0 0 15px currentColor;animation:pulse 2.2s ease-in-out infinite}.swatch:nth-child(2){animation-delay:.2s}.swatch:nth-child(3){animation-delay:.4s}.swatch:nth-child(4){animation-delay:.6s}.swatch:nth-child(5){animation-delay:.8s}.telegram{margin-top:16px;display:flex;align-items:center;justify-content:center;gap:10px;padding:14px 16px;border-radius:18px;text-decoration:none;color:#e0f2fe;background:linear-gradient(120deg,rgba(14,165,233,.12),rgba(255,255,255,.045));border:1px solid rgba(56,189,248,.25);box-shadow:inset 0 1px rgba(255,255,255,.08);transition:.25s}.telegram:hover{transform:translateY(-2px);border-color:var(--a)}.tg{width:35px;height:35px;border-radius:50%;display:grid;place-items:center;background:#229ed9;box-shadow:0 0 20px rgba(34,158,217,.35)}.credits{display:flex;gap:10px;margin-top:10px}.credit{flex:1;text-align:center;padding:11px;border-radius:15px;color:#94a3b8;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);font-size:11px;text-decoration:none}.credit b{display:block;color:#e2e8f0;margin-top:3px}.bar{position:fixed;left:50%;bottom:15px;transform:translateX(-50%);width:min(720px,92vw);height:7px;border-radius:999px;background:linear-gradient(90deg,#22d3ee,#3b82f6,#8b5cf6,#ec4899,#f59e0b,#22c55e,#22d3ee);background-size:300% 100%;box-shadow:0 0 24px rgba(59,130,246,.35);animation:rainbow 5s linear infinite;z-index:3}.en .fa{display:none!important}.en .en{display:inline!important}@keyframes rainbow{to{background-position:300% 0}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}@keyframes cardIn{from{opacity:0;transform:translateY(25px) rotateX(7deg)}to{opacity:1;transform:none}}@keyframes pulse{50%{transform:scale(1.12)}}@keyframes borderFlow{to{filter:hue-rotate(360deg)}}
+</style></head>
+<body class="fa">
+<div class="scene"><div class="grid"></div><div class="orb o1"></div><div class="orb o2"></div></div>
+<main class="wrap"><section class="card">
+<div class="logo">A</div><div class="brand">ALPHA</div><div class="sub"><span class="fa">ورود به پنل مدیریت</span><span class="en" style="display:none">Sign in to your control panel</span></div>
+<form onsubmit="handleLogin(event)">
+<div class="field"><label><span class="fa">نام کاربری</span><span class="en" style="display:none">Username</span></label><input id="username" class="input" autocomplete="username" placeholder="admin" required></div>
+<div class="field"><label><span class="fa">رمز عبور</span><span class="en" style="display:none">Password</span></label><div class="input-wrap"><input id="password" type="password" class="input" autocomplete="current-password" placeholder="••••••••" required><button class="eye" type="button" onclick="toggleEye()">◉</button></div></div>
+<button type="submit" id="submit-btn" class="primary"><span class="fa">ورود به Alpha</span><span class="en" style="display:none">Sign in to Alpha</span></button>
+</form>
+<div class="tools"><button class="tool" onclick="toggleLang()">🌐 فارسی / English</button><button class="tool" onclick="toggleTheme()">☀️ / 🌙 <span class="fa">تم</span><span class="en" style="display:none">Theme</span></button></div>
+<div class="colors"><button class="swatch" style="background:#22d3ee;color:#22d3ee" onclick="setColor('#22d3ee','#3b82f6')"></button><button class="swatch" style="background:#8b5cf6;color:#8b5cf6" onclick="setColor('#8b5cf6','#ec4899')"></button><button class="swatch" style="background:#14b8a6;color:#14b8a6" onclick="setColor('#14b8a6','#22c55e')"></button><button class="swatch" style="background:#f59e0b;color:#f59e0b" onclick="setColor('#f59e0b','#ef4444')"></button><button class="swatch" style="background:#ec4899;color:#ec4899" onclick="setColor('#ec4899','#8b5cf6')"></button></div>
+<a class="telegram" href="https://t.me/Mehtif" target="_blank" rel="noopener"><span class="tg">➤</span><span><b><span class="fa">کانال تلگرام Alpha</span><span class="en" style="display:none">Alpha Telegram Channel</span></b><small> @Mehtif</small></span></a>
+<div class="credits"><a class="credit" href="https://t.me/V2rayTun0" target="_blank" rel="noopener"><span class="fa">سازنده</span><span class="en" style="display:none">Creator</span><b>@V2rayTun0</b></a><div class="credit"><span class="fa">پروژه</span><span class="en" style="display:none">Project</span><b>Alpha</b></div></div>
+</section></main><div class="bar"></div>
+<script>
+function toggleEye(){const i=document.getElementById('password'),b=document.querySelector('.eye');i.type=i.type==='password'?'text':'password';b.textContent=i.type==='password'?'◉':'◎'}
+function setColor(a,b){document.documentElement.style.setProperty('--a',a);document.documentElement.style.setProperty('--b',b);localStorage.setItem('alpha-a',a);localStorage.setItem('alpha-b',b)}
+function toggleTheme(){const light=document.body.dataset.theme==='light';document.body.dataset.theme=light?'dark':'light';document.body.style.setProperty('--bg',light?'#020617':'#eef6ff');document.body.style.setProperty('--text',light?'#f8fafc':'#0f172a');localStorage.setItem('alpha-theme',light?'dark':'light')}
+function toggleLang(){const en=document.body.classList.contains('en');document.body.classList.toggle('en',!en);document.body.dir=en?'rtl':'ltr';document.documentElement.lang=en?'fa':'en';localStorage.setItem('alpha-lang',en?'fa':'en')}
+function applyPrefs(){const a=localStorage.getItem('alpha-a'),b=localStorage.getItem('alpha-b');if(a&&b)setColor(a,b);if(localStorage.getItem('alpha-theme')==='light'){document.body.dataset.theme='light';document.body.style.setProperty('--bg','#eef6ff');document.body.style.setProperty('--text','#0f172a')}}
+async function handleLogin(e){e.preventDefault();const username=document.getElementById('username').value.trim(),password=document.getElementById('password').value.trim(),btn=document.getElementById('submit-btn');btn.disabled=true;btn.style.opacity='.6';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});const d=await r.json();if(r.ok&&d.success){location.href='/panel'}else alert(d.error||'نام کاربری یا رمز عبور اشتباه است')}catch(e){alert('خطا در ارتباط با سرور')}finally{btn.disabled=false;btn.style.opacity='1'}}
+applyPrefs();if(localStorage.getItem('alpha-lang')==='en')toggleLang();
+</script></body></html>`,
 	panel: `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
