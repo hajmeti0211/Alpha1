@@ -1,12 +1,5 @@
 {
   "name": "alpha1",
   "main": "Source.js",
-  "compatibility_date": "2026-10-05",
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "alpha1-db",
-      "database_id": "37f2a8ab-c3bb-43e0-a5c6-973f93d45187"
-    }
-  ]
+  "compatibility_date": "2026-10-05"
 }
